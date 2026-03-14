@@ -1,0 +1,25 @@
+import pandas as pd
+
+def prepare_categorical_dtypes(df, exclude_cols=None):
+    """
+    Identifies all columns with 'object' data type and converts them 
+    to 'category' dtype, making them ready for LightGBM native handling.
+    """
+    df_transformed = df.copy()
+    
+    # Identify object columns
+    obj_cols = df_transformed.select_dtypes(include=['object']).columns.tolist()
+    
+    # Filter out columns you might not want to convert (like the target)
+    if exclude_cols:
+        obj_cols = [c for c in obj_cols if c not in exclude_cols]
+    
+    # Perform conversion
+    for col in obj_cols:
+        df_transformed[col] = df_transformed[col].astype('category')
+        
+    print(f"[*] Successfully converted {len(obj_cols)} columns to 'category' type.")
+    if len(obj_cols) > 0:
+        print(f"    Columns: {obj_cols}")
+        
+    return df_transformed
