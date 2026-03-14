@@ -1,0 +1,139 @@
+import pandas as pd
+import numpy as np
+import lightgbm as lgb
+import joblib
+from sklearn.model_selection import StratifiedKFold, KFold, GridSearchCV
+from sklearn.metrics import (
+    r2_score, 
+    mean_squared_error, 
+    mean_absolute_error, 
+    mean_absolute_percentage_error, 
+    mean_squared_log_error,
+    make_scorer
+)
+import warnings
+
+def train_lgbm_regression(df_train, df_test, target_col, random_state, n_folds, stratify_cols):
+    """
+    Trains a LightGBM regressor using stratified cross-validation and grid search.
+    
+    Returns:
+    tuple: (Train/Test metrics DataFrame, CV metrics DataFrame)
+    Outputs: Saves model to .pkl, and train/test predictions to .csv
+    """
+    print("Preparing data...")
+    X_train = df_train.drop(columns=[target_col])
+    y_train = df_train[target_col]
+    X_test = df_test.drop(columns=[target_col])
+    y_test = df_test[target_col]
+    
+    # 1. Create custom CV splits for Stratified Regression
+    splits = []
+    if stratify_cols and len(stratify_cols) > 0:
+        # Create a combined string column representing the unique strata
+        stratify_series = df_train[stratify_cols].astype(str).agg('-'.join, axis=1)
+        skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=random_state)
+        
+        try:
+            for train_idx, val_idx in skf.split(np.zeros(len(df_train)), stratify_series):
+                splits.append((train_idx, val_idx))
+            print(f"Created {n_folds} stratified folds using: {stratify_cols}")
+        except ValueError as e:
+            print(f"Stratification failed (likely rare classes). Falling back to standard KFold. Error: {e}")
+            kf = KFold(n_splits=n_folds, shuffle=True, random_state=random_state)
+            splits = list(kf.split(X_train))
+    else:
+        kf = KFold(n_splits=n_folds, shuffle=True, random_state=random_state)
+        splits = list(kf.split(X_train))
+        print(f"Created {n_folds} standard folds.")
+
+    # 2. Setup Grid Search with multiple scoring metrics
+    # Note: MSLE fails on negative predictions/targets, so we create a custom safe scorer
+    def safe_msle(y_true, y_pred):
+        y_true_safe = np.clip(y_true, 0, None)
+        y_pred_safe = np.clip(y_pred, 0, None)
+        return mean_squared_log_error(y_true_safe, y_pred_safe)
+
+    scoring = {
+        'R2': 'r2',
+        'RMSE': 'neg_root_mean_squared_error',
+        'MAE': 'neg_mean_absolute_error',
+        'MAPE': 'neg_mean_absolute_percentage_error',
+        'MSLE': make_scorer(safe_msle, greater_is_better=False)
+    }
+
+    param_grid = {
+        'n_estimators': [50, 100, 200],
+        'learning_rate': [0.01, 0.05, 0.1],
+        'max_depth': [-1, 5, 10],
+        'num_leaves': [31, 50]
+    }
+
+    lgbm = lgb.LGBMRegressor(random_state=random_state, verbose=-1)
+    
+    print("Running GridSearchCV...")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        grid = GridSearchCV(
+            estimator=lgbm, 
+            param_grid=param_grid, 
+            cv=splits, 
+            scoring=scoring, 
+            refit='RMSE', # Refits the best model based on minimizing RMSE
+            n_jobs=-1,
+            return_train_score=False
+        )
+        grid.fit(X_train, y_train)
+
+    best_model = grid.best_estimator_
+    print(f"Best parameters found: {grid.best_params_}")
+
+    # 3. Save the model
+    model_filename = 'best_lgbm_model.pkl'
+    joblib.dump(best_model, model_filename)
+    print(f"Model saved to {model_filename}")
+
+    # 4. Generate Predictions
+    train_preds = best_model.predict(X_train)
+    test_preds = best_model.predict(X_test)
+
+    # 5. Calculate overall performance parameters
+    def get_metrics(y_true, y_pred):
+        return {
+            'R^2': r2_score(y_true, y_pred),
+            'RMSE': np.sqrt(mean_squared_error(y_true, y_pred)),
+            'MAE': mean_absolute_error(y_true, y_pred),
+            'MAPE': mean_absolute_percentage_error(y_true, y_pred),
+            'MSLE': safe_msle(y_true, y_pred)
+        }
+
+    df_performance = pd.DataFrame([
+        get_metrics(y_train, train_preds),
+        get_metrics(y_test, test_preds)
+    ], index=['Train', 'Test'])
+
+    # 6. Extract CV performance parameters
+    cv_results = pd.DataFrame(grid.cv_results_)
+    df_cv_performance = pd.DataFrame({
+        'Params': cv_results['params'].astype(str),
+        'Mean_R^2': cv_results['mean_test_R2'],
+        'Mean_RMSE': -cv_results['mean_test_RMSE'], 
+        'Mean_MAE': -cv_results['mean_test_MAE'],
+        'Mean_MAPE': -cv_results['mean_test_MAPE'],
+        'Mean_MSLE': -cv_results['mean_test_MSLE']
+    })
+
+    # 7. Save predictions to CSV
+    df_train_out = df_train.copy()
+    df_train_out[f'{target_col}_Prediction'] = train_preds
+    train_csv_filename = 'train_predictions.csv'
+    df_train_out.to_csv(train_csv_filename, index=False)
+    
+    df_test_out = df_test.copy()
+    df_test_out[f'{target_col}_Prediction'] = test_preds
+    test_csv_filename = 'test_predictions.csv'
+    df_test_out.to_csv(test_csv_filename, index=False)
+    
+    print(f"Predictions saved to {train_csv_filename} and {test_csv_filename}")
+
+    return df_performance, df_cv_performance
