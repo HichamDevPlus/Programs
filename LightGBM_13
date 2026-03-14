@@ -1,0 +1,131 @@
+import pandas as pd
+import numpy as np
+import lightgbm as lgb
+import joblib
+import shap
+import json
+from sklearn.model_selection import StratifiedKFold, KFold, GridSearchCV
+from sklearn.metrics import (
+    r2_score, mean_squared_error, mean_absolute_error, 
+    mean_absolute_percentage_error
+)
+import warnings
+
+def train_lgbm_robust_pipeline(df_train, df_test, target_col, random_state, n_folds, stratify_cols, prefix='LGBM_Model'):
+    """
+    Final Robust Pipeline:
+    - Auto-detects and handles Categorical (Object) variables
+    - Explicitly purges stratification helpers
+    - Full Exports & SHAP Interpretability
+    """
+    
+    # --- 1. Cleanup & Feature Selection ---
+    cols_to_drop = [target_col]
+    if stratify_cols:
+        cols_to_drop.extend(stratify_cols)
+    if 'stratify_key' in df_train.columns:
+        cols_to_drop.append('stratify_key')
+        
+    X_train = df_train.drop(columns=[c for c in cols_to_drop if c in df_train.columns]).copy()
+    y_train = df_train[target_col]
+    X_test = df_test.drop(columns=[c for c in cols_to_drop if c in df_test.columns]).copy()
+    y_test = df_test[target_col]
+
+    # --- 2. Handle Object Types (Categorical Encoding) ---
+    # LightGBM handles 'category' dtype natively and very efficiently
+    cat_features = X_train.select_dtypes(include=['object', 'category']).columns.tolist()
+    
+    for col in cat_features:
+        X_train[col] = X_train[col].astype('category')
+        X_test[col] = X_test[col].astype('category')
+    
+    print(f"[*] Detected {len(cat_features)} categorical features: {cat_features}")
+
+    # --- 3. CV Strategy ---
+    if stratify_cols and len(stratify_cols) > 0:
+        strat_handle = df_train[stratify_cols].astype(str).agg('-'.join, axis=1)
+        skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=random_state)
+        splits = list(skf.split(np.zeros(len(df_train)), strat_handle))
+    else:
+        kf = KFold(n_splits=n_folds, shuffle=True, random_state=random_state)
+        splits = list(kf.split(X_train))
+
+    # --- 4. Grid Search ---
+    # We pass 'categorical_feature' to the fit params via GridSearchCV
+    param_grid = {
+        'n_estimators': [100, 200],
+        'learning_rate': [0.05, 0.1],
+        'max_depth': [-1, 5, 10],
+        'num_leaves': [31, 50]
+    }
+    
+    lgbm = lgb.LGBMRegressor(random_state=random_state, verbose=-1)
+    
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        grid = GridSearchCV(
+            estimator=lgbm, 
+            param_grid=param_grid, 
+            cv=splits, 
+            scoring='neg_root_mean_squared_error', 
+            refit=True, 
+            n_jobs=-1
+        )
+        # We tell LightGBM which columns are categorical here
+        grid.fit(X_train, y_train, categorical_feature=cat_features)
+    
+    best_model = grid.best_estimator_
+    
+    # --- 5. Performance & Metadata ---
+    params_dict = best_model.get_params()
+    df_hyperparams = pd.DataFrame(list(params_dict.items()), columns=['Parameter', 'Value'])
+    
+    def get_row_metrics(y_true, y_pred, fold_num, set_type):
+        return {
+            'Fold': fold_num, 'Type': set_type, 'N_Obs': len(y_true),
+            'Mean_Target': np.mean(y_true), 'R2': r2_score(y_true, y_pred),
+            'RMSE': np.sqrt(mean_squared_error(y_true, y_pred)),
+            'MAE': mean_absolute_error(y_true, y_pred),
+            'MAPE': mean_absolute_percentage_error(y_true, y_pred),
+            'Std_Residuals': np.std(y_true - y_pred)
+        }
+
+    train_preds = best_model.predict(X_train)
+    test_preds = best_model.predict(X_test)
+
+    all_performance_rows = [
+        get_row_metrics(y_train, train_preds, 0, 'Overall_Train'),
+        get_row_metrics(y_test, test_preds, 0, 'Overall_Test')
+    ]
+
+    for i, (t_idx, v_idx) in enumerate(splits):
+        all_performance_rows.append(get_row_metrics(y_train.iloc[v_idx], best_model.predict(X_train.iloc[v_idx]), i + 1, 'Validation'))
+        all_performance_rows.append(get_row_metrics(y_train.iloc[t_idx], best_model.predict(X_train.iloc[t_idx]), i + 1, 'Train'))
+
+    df_performance_final = pd.DataFrame(all_performance_rows)
+
+    # --- 6. SHAP Interpretability ---
+    # Note: SHAP can sometimes struggle with raw 'category' dtypes in certain versions,
+    # so we ensure the explainer is initialized correctly.
+    explainer = shap.TreeExplainer(best_model)
+    shap_values = explainer.shap_values(X_test)
+    df_shap = pd.DataFrame({
+        'Feature': X_train.columns,
+        'SHAP_Importance': np.abs(shap_values).mean(axis=0)
+    }).sort_values(by='SHAP_Importance', ascending=False).reset_index(drop=True)
+
+    # --- 7. EXPORTS ---
+    with pd.ExcelWriter(f'{prefix}_Report.xlsx', engine='openpyxl') as writer:
+        df_performance_final.to_excel(writer, sheet_name='Performance_Metrics', index=False)
+        df_shap.to_excel(writer, sheet_name='SHAP_Interpretability', index=False)
+        df_hyperparams.to_excel(writer, sheet_name='Model_Hyperparameters', index=False)
+
+    df_train.assign(Prediction=best_model.predict(X_train)).to_csv(f'{prefix}_train_preds.csv', sep=';', index=False)
+    df_test.assign(Prediction=test_preds).to_csv(f'{prefix}_test_preds.csv', sep=';', index=False)
+    joblib.dump(best_model, f'{prefix}_model.pkl')
+
+    metadata = {"best_params": params_dict, "cat_features": cat_features, "best_cv_rmse": float(-grid.best_score_)}
+    with open(f'{prefix}_metadata.json', 'w') as f:
+        json.dump(metadata, f, indent=4)
+
+    return df_performance_final, df_shap, df_hyperparams, shap_values, X_test
