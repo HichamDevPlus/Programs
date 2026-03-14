@@ -82,3 +82,9 @@ def train_lgbm_with_shap_to_excel(df_train, df_test, target_col, random_state, n
 
     print(f"SHAP Report saved to {filename}")
     return df_performance_final, df_shap, shap_values, X_test
+
+
+
+import shap
+# Run this after calling the function
+shap.summary_plot(shap_values, X_test)
