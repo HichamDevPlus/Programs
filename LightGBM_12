@@ -1,0 +1,149 @@
+import pandas as pd
+import numpy as np
+import lightgbm as lgb
+import joblib
+import shap
+import json
+from sklearn.model_selection import StratifiedKFold, KFold, GridSearchCV
+from sklearn.metrics import (
+    r2_score, mean_squared_error, mean_absolute_error, 
+    mean_absolute_percentage_error
+)
+import warnings
+
+def train_lgbm_full_pipeline_final(df_train, df_test, target_col, random_state, n_folds, stratify_cols, prefix='LGBM_Model'):
+    """
+    Complete LightGBM pipeline:
+    - Independent stratification logic (no 'stratify_key' in features)
+    - GridSearch CV for hyperparameter tuning
+    - Unified performance metrics (MAE, MAPE, RMSE, R2)
+    - SHAP Interpretability
+    - Exports: Excel (3 tabs), CSV Predictions (;), Model (.pkl), Metadata (.json)
+    
+    Returns: df_performance, df_shap, df_hyperparams, shap_values, X_test
+    """
+    
+    # --- 1. Features & Target Definition ---
+    # We define these immediately to ensure no temporary keys are included
+    X_train = df_train.drop(columns=[target_col])
+    y_train = df_train[target_col]
+    X_test = df_test.drop(columns=[target_col])
+    y_test = df_test[target_col]
+    
+    # --- 2. CV Strategy (Independent of X_train) ---
+    if stratify_cols and len(stratify_cols) > 0:
+        # Create a local series for splitting only. This is NEVER added to X_train.
+        strat_handle = df_train[stratify_cols].astype(str).agg('-'.join, axis=1)
+        skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=random_state)
+        # Check if any class has too few members for the requested n_folds
+        splits = list(skf.split(np.zeros(len(df_train)), strat_handle))
+        print(f"[*] Stratified CV initialized on: {stratify_cols}")
+    else:
+        kf = KFold(n_splits=n_folds, shuffle=True, random_state=random_state)
+        splits = list(kf.split(X_train))
+        print("[*] Standard K-Fold CV initialized.")
+
+    # --- 3. Grid Search ---
+    param_grid = {
+        'n_estimators': [100, 200],
+        'learning_rate': [0.05, 0.1],
+        'max_depth': [-1, 5, 10],
+        'num_leaves': [31, 50]
+    }
+    lgbm = lgb.LGBMRegressor(random_state=random_state, verbose=-1)
+    
+    print("[*] Running Grid Search...")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        grid = GridSearchCV(
+            estimator=lgbm, 
+            param_grid=param_grid, 
+            cv=splits, 
+            scoring='neg_root_mean_squared_error', 
+            refit=True, 
+            n_jobs=-1,
+            return_train_score=True
+        )
+        grid.fit(X_train, y_train)
+    
+    best_model = grid.best_estimator_
+    
+    # --- 4. Hyperparameters DataFrame ---
+    params_dict = best_model.get_params()
+    df_hyperparams = pd.DataFrame(list(params_dict.items()), columns=['Parameter', 'Value'])
+    
+    # --- 5. Performance Metrics Logic ---
+    def get_row_metrics(y_true, y_pred, fold_num, set_type):
+        return {
+            'Fold': fold_num, 
+            'Type': set_type, 
+            'N_Obs': len(y_true),
+            'Mean_Target': np.mean(y_true), 
+            'R2': r2_score(y_true, y_pred),
+            'RMSE': np.sqrt(mean_squared_error(y_true, y_pred)),
+            'MAE': mean_absolute_error(y_true, y_pred),
+            'MAPE': mean_absolute_percentage_error(y_true, y_pred),
+            'Std_Residuals': np.std(y_true - y_pred)
+        }
+
+    train_preds_all = best_model.predict(X_train)
+    test_preds_all = best_model.predict(X_test)
+
+    # Initialize master performance list with Overall (Fold 0)
+    all_performance_rows = [
+        get_row_metrics(y_train, train_preds_all, 0, 'Overall_Train'),
+        get_row_metrics(y_test, test_preds_all, 0, 'Overall_Test')
+    ]
+
+    # Add Per-Fold Performance
+    for i, (t_idx, v_idx) in enumerate(splits):
+        # Validation subset of this fold
+        val_fold_preds = best_model.predict(X_train.iloc[v_idx])
+        all_performance_rows.append(get_row_metrics(y_train.iloc[v_idx], val_fold_preds, i + 1, 'Validation'))
+        
+        # Training subset of this fold
+        train_fold_preds = best_model.predict(X_train.iloc[t_idx])
+        all_performance_rows.append(get_row_metrics(y_train.iloc[t_idx], train_fold_preds, i + 1, 'Train'))
+
+    df_performance_final = pd.DataFrame(all_performance_rows)
+
+    # --- 6. SHAP Interpretability ---
+    print("[*] Calculating SHAP values...")
+    explainer = shap.TreeExplainer(best_model)
+    shap_values = explainer.shap_values(X_test)
+    
+    # Calculate global importance (mean absolute SHAP)
+    global_shap = np.abs(shap_values).mean(axis=0)
+    df_shap = pd.DataFrame({
+        'Feature': X_train.columns,
+        'SHAP_Importance': global_shap
+    }).sort_values(by='SHAP_Importance', ascending=False).reset_index(drop=True)
+
+    # --- 7. EXPORTS ---
+    
+    # A. Excel Report (3 Sheets)
+    with pd.ExcelWriter(f'{prefix}_Report.xlsx', engine='openpyxl') as writer:
+        df_performance_final.to_excel(writer, sheet_name='Performance_Metrics', index=False)
+        df_shap.to_excel(writer, sheet_name='SHAP_Interpretability', index=False)
+        df_hyperparams.to_excel(writer, sheet_name='Model_Hyperparameters', index=False)
+
+    # B. CSV Predictions (using ";" separator)
+    df_train.assign(Prediction=train_preds_all).to_csv(f'{prefix}_train_preds.csv', sep=';', index=False)
+    df_test.assign(Prediction=test_preds_all).to_csv(f'{prefix}_test_preds.csv', sep=';', index=False)
+
+    # C. Model Object (.pkl)
+    joblib.dump(best_model, f'{prefix}_model.pkl')
+
+    # D. Metadata (.json)
+    metadata = {
+        "best_params": params_dict,
+        "features": list(X_train.columns),
+        "best_cv_rmse": float(-grid.best_score_),
+        "target_col": target_col
+    }
+    with open(f'{prefix}_metadata.json', 'w') as f:
+        json.dump(metadata, f, indent=4)
+
+    print(f"[*] Pipeline Complete. Files exported with prefix: {prefix}")
+    
+    return df_performance_final, df_shap, df_hyperparams, shap_values, X_test
