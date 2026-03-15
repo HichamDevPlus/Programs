@@ -1,0 +1,178 @@
+import pandas as pd
+import numpy as np
+import lightgbm as lgb
+import joblib
+import shap
+import json
+import logging
+import gc
+from sklearn.model_selection import StratifiedKFold, KFold, GridSearchCV, train_test_split
+from sklearn.metrics import (
+    r2_score, mean_squared_error, mean_absolute_error, 
+    mean_absolute_percentage_error
+)
+import warnings
+
+# Initialize logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+def train_lgbm_robust_pipeline(df_train, df_test, target_col, random_state, n_folds, stratify_cols, prefix='LGBM_Model'):
+    """
+    Enhanced Robust Pipeline:
+    - Memory-optimized via type downcasting
+    - Safe stratification with automated fallback
+    - Production logging & Early stopping
+    - Expanded hyperparameter search
+    """
+    
+    # --- 1. Memory Optimization & Cleanup ---
+    def optimize_memory(df):
+        # Downcast floats and ints to save RAM without losing precision for LGBM
+        floats = df.select_dtypes(include=['float64']).columns
+        df[floats] = df[floats].apply(pd.to_numeric, downcast='float')
+        ints = df.select_dtypes(include=['int64']).columns
+        df[ints] = df[ints].apply(pd.to_numeric, downcast='integer')
+        return df
+
+    df_train = optimize_memory(df_train)
+    df_test = optimize_memory(df_test)
+
+    cols_to_drop = [target_col]
+    if stratify_cols:
+        cols_to_drop.extend(stratify_cols)
+    if 'stratify_key' in df_train.columns:
+        cols_to_drop.append('stratify_key')
+        
+    X_train = df_train.drop(columns=[c for c in cols_to_drop if c in df_train.columns]).copy()
+    y_train = df_train[target_col]
+    X_test = df_test.drop(columns=[c for c in cols_to_drop if c in df_test.columns]).copy()
+    y_test = df_test[target_col]
+
+    # --- 2. Handle Categorical Features ---
+    cat_features = X_train.select_dtypes(include=['object', 'category']).columns.tolist()
+    for col in cat_features:
+        X_train[col] = X_train[col].astype('category')
+        X_test[col] = X_test[col].astype('category')
+    
+    logger.info(f"Detected {len(cat_features)} categorical features.")
+
+    # --- 3. Robust CV Strategy with Stratification Check ---
+    if stratify_cols and len(stratify_cols) > 0:
+        strat_handle = df_train[stratify_cols].astype(str).agg('-'.join, axis=1)
+        min_group_size = strat_handle.value_counts().min()
+        
+        if min_group_size < n_folds:
+            logger.warning(f"Smallest stratification group has {min_group_size} members. Falling back to standard KFold.")
+            kf = KFold(n_splits=n_folds, shuffle=True, random_state=random_state)
+            splits = list(kf.split(X_train))
+        else:
+            skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=random_state)
+            splits = list(skf.split(np.zeros(len(df_train)), strat_handle))
+    else:
+        kf = KFold(n_splits=n_folds, shuffle=True, random_state=random_state)
+        splits = list(kf.split(X_train))
+
+    # --- 4. Optimized Grid Search & Early Stopping ---
+    # Expanded grid for better convergence
+    param_grid = {
+        'n_estimators': [500, 1000], # Increased as early stopping will prune this
+        'learning_rate': [0.01, 0.05, 0.1],
+        'max_depth': [-1, 7, 12],
+        'num_leaves': [31, 63],
+        'colsample_bytree': [0.8, 1.0],
+        'subsample': [0.8, 1.0],
+        'reg_alpha': [0.1, 0.5],
+        'reg_lambda': [0.1, 0.5]
+    }
+    
+    lgbm = lgb.LGBMRegressor(random_state=random_state, verbose=-1)
+    
+    # Internal split for early stopping validation (prevents leakage from X_test)
+    X_sub_train, X_val, y_sub_train, y_val = train_test_split(
+        X_train, y_train, test_size=0.1, random_state=random_state
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        grid = GridSearchCV(
+            estimator=lgbm, 
+            param_grid=param_grid, 
+            cv=splits, 
+            scoring='neg_root_mean_squared_error', 
+            refit=True, 
+            n_jobs=-1
+        )
+        
+        # Adding Early Stopping via fit_params (using the sub-validation set)
+        grid.fit(
+            X_train, y_train, 
+            categorical_feature=cat_features,
+            eval_set=[(X_val, y_val)],
+            eval_metric='rmse',
+            callbacks=[lgb.early_stopping(stopping_rounds=50, verbose=False)]
+        )
+    
+    best_model = grid.best_estimator_
+    logger.info("Grid Search complete. Best model selected.")
+
+    # --- 5. Performance & Metadata ---
+    params_dict = best_model.get_params()
+    df_hyperparams = pd.DataFrame(list(params_dict.items()), columns=['Parameter', 'Value'])
+    
+    def get_row_metrics(y_true, y_pred, fold_num, set_type):
+        return {
+            'Fold': fold_num, 'Type': set_type, 'N_Obs': len(y_true),
+            'Mean_Target': np.mean(y_true), 'R2': r2_score(y_true, y_pred),
+            'RMSE': np.sqrt(mean_squared_error(y_true, y_pred)),
+            'MAE': mean_absolute_error(y_true, y_pred),
+            'MAPE': mean_absolute_percentage_error(y_true, y_pred),
+            'Std_Residuals': np.std(y_true - y_pred)
+        }
+
+    train_preds = best_model.predict(X_train)
+    test_preds = best_model.predict(X_test)
+
+    all_performance_rows = [
+        get_row_metrics(y_train, train_preds, 0, 'Overall_Train'),
+        get_row_metrics(y_test, test_preds, 0, 'Overall_Test')
+    ]
+
+    for i, (t_idx, v_idx) in enumerate(splits):
+        # Optimized: Only predict on validation to save time/memory
+        val_fold_preds = best_model.predict(X_train.iloc[v_idx])
+        all_performance_rows.append(get_row_metrics(y_train.iloc[v_idx], val_fold_preds, i + 1, 'Validation'))
+
+    df_performance_final = pd.DataFrame(all_performance_rows)
+
+    # --- 6. SHAP Interpretability ---
+    # Background sampling for performance
+    explainer = shap.TreeExplainer(best_model)
+    shap_sample = X_test.sample(min(len(X_test), 1000), random_state=random_state)
+    shap_values = explainer.shap_values(shap_sample)
+    
+    df_shap = pd.DataFrame({
+        'Feature': X_train.columns,
+        'SHAP_Importance': np.abs(shap_values).mean(axis=0)
+    }).sort_values(by='SHAP_Importance', ascending=False).reset_index(drop=True)
+
+    # --- 7. EXPORTS ---
+    with pd.ExcelWriter(f'{prefix}_Report.xlsx', engine='openpyxl') as writer:
+        df_performance_final.to_excel(writer, sheet_name='Performance_Metrics', index=False)
+        df_shap.to_excel(writer, sheet_name='SHAP_Interpretability', index=False)
+        df_hyperparams.to_excel(writer, sheet_name='Model_Hyperparameters', index=False)
+
+    df_train.assign(Prediction=train_preds).to_csv(f'{prefix}_train_preds.csv', sep=';', index=False)
+    df_test.assign(Prediction=test_preds).to_csv(f'{prefix}_test_preds.csv', sep=';', index=False)
+    joblib.dump(best_model, f'{prefix}_model.pkl')
+
+    metadata = {
+        "best_params": {k: v for k, v in params_dict.items() if isinstance(v, (int, float, str, list))}, 
+        "cat_features": cat_features, 
+        "best_cv_rmse": float(-grid.best_score_)
+    }
+    with open(f'{prefix}_metadata.json', 'w') as f:
+        json.dump(metadata, f, indent=4)
+
+    gc.collect() # Final memory cleanup
+    return df_performance_final, df_shap, df_hyperparams, shap_values, X_test
