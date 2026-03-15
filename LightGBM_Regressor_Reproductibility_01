@@ -1,0 +1,84 @@
+import pandas as pd
+import numpy as np
+import lightgbm as lgb
+import json
+import joblib
+import sklearn.metrics as metrics
+import sys
+
+def audit_lightgbm_reproducibility(df_train, df_test, target_col, json_metadata_path, input_model_path):
+    """
+    A professional-grade audit function to reassess model reproducibility.
+    Compares predictions, performance metrics, and feature importance.
+    """
+    
+    # 1. Environment Capture (Audit Trail)
+    env_info = {
+        "python_version": sys.version,
+        "lgb_version": lgb.__version__,
+        "pandas_version": pd.__version__
+    }
+    
+    # 2. Load Artifacts
+    with open(json_metadata_path, 'r') as f:
+        metadata = json.load(f)
+    
+    params = metadata.get('params', metadata)
+    input_model = joblib.load(input_model_path)
+    
+    # 3. Data Preparation
+    X_train, y_train = df_train.drop(columns=[target_col]), df_train[target_col]
+    X_test, y_test = df_test.drop(columns=[target_col]), df_test[target_col]
+    
+    # 4. Re-training
+    # We use the exact params. Standard practice: ensure 'seed' or 'random_state' is in JSON
+    reassessed_model = lgb.LGBMRegressor(**params)
+    reassessed_model.fit(X_train, y_train)
+    
+    # 5. Prediction & Metric Comparison
+    preds_input = input_model.predict(X_test)
+    preds_reassessed = reassessed_model.predict(X_test)
+    
+    # Calculating Mean Squared Error (MSE) for both
+    # $MSE = \frac{1}{n} \sum_{i=1}^{n} (y_i - \hat{y}_i)^2$
+    mse_input = metrics.mean_squared_squared_error(y_test, preds_input)
+    mse_reassessed = metrics.mean_squared_error(y_test, preds_reassessed)
+    
+    # 6. Verification Logic
+    # We check for numerical identity and statistical parity
+    identical_preds = np.allclose(preds_input, preds_reassessed, atol=1e-7)
+    mse_diff = abs(mse_input - mse_reassessed)
+    
+    # 7. Feature Importance Alignment (Audit Requirement)
+    fi_input = input_model.feature_importances_
+    fi_reassessed = reassessed_model.feature_importances_
+    fi_match = np.array_equal(fi_input, fi_reassessed)
+    
+    # Status Message
+    if identical_preds and fi_match:
+        status = "SUCCESS: Model is fully reproducible."
+    elif mse_diff < 1e-6:
+        status = "WARNING: Minimal numerical variance detected, but statistically equivalent."
+    else:
+        status = "FAILURE: Significant divergence detected."
+
+    # 8. Save Outputs
+    joblib.dump(reassessed_model, "audit_reassessed_model.pkl")
+    
+    # Comprehensive Comparison CSVs
+    for name, df, p_in, p_re in [("train", df_train, input_model.predict(X_train), reassessed_model.predict(X_train)), 
+                                  ("test", df_test, preds_input, preds_reassessed)]:
+        comp_df = pd.DataFrame({
+            'actual': df[target_col],
+            'input_model_pred': p_in,
+            'reassessed_model_pred': p_re,
+            'abs_diff': np.abs(p_in - p_re)
+        })
+        comp_df.to_csv(f"audit_preds_{name}_comparison.csv", index=False)
+        
+    return {
+        "status_message": status,
+        "env_info": env_info,
+        "mse_divergence": mse_diff,
+        "files_generated": ["audit_reassessed_model.pkl", "audit_preds_train_comparison.csv", "audit_preds_test_comparison.csv"]
+    }
