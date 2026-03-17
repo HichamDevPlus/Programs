@@ -1,0 +1,75 @@
+import pickle
+import numpy as np
+
+def compare_ml_models(path_a, path_b, rtol=1e-05, atol=1e-08):
+    """
+    Compares two pickled models for identity, functional equivalence, or difference.
+    Understanding the Comparison Levels
+
+    Identical: Every parameter, internal weight, and random seed matches exactly. This usually happens when the model was trained on the exact same hardware and software version.
+
+    Considered Identical (Functional Equivalence): The hyperparameters are the same, but the internal weights (β coefficients, etc.) differ by a tiny fraction (e.g., 10−8). This is common in MRM when moving between different Python versions or CPU architectures. In a review, you would document this but usually conclude the model is successfully reproduced.
+
+    Different:
+
+    Configuration Mismatch: The model was trained with different settings (e.g., max_depth=5 vs max_depth=10).
+
+    Data Mismatch: If hyperparameters match but weights are wildly different, the model was trained on a different dataset or a different version of the data.
+
+
+    """
+    with open(path_a, 'rb') as f:
+        model_a = pickle.load(f)
+    with open(path_b, 'rb') as f:
+        model_b = pickle.load(f)
+
+    report = {"status": "Identical", "differences": []}
+
+    # 1. Type Check
+    if type(model_a) != type(model_b):
+        report["status"] = "Different"
+        report["differences"].append(f"Model Type Mismatch: {type(model_a)} vs {type(model_b)}")
+        return report
+
+    # 2. Hyperparameter Check (Configuration)
+    params_a = model_a.get_params() if hasattr(model_a, 'get_params') else {}
+    params_b = model_b.get_params() if hasattr(model_b, 'get_params') else {}
+    
+    param_diffs = [k for k in params_a if params_a.get(k) != params_b.get(k)]
+    if param_diffs:
+        report["status"] = "Different"
+        for k in param_diffs:
+            report["differences"].append(f"Hyperparameter '{k}': {params_a[k]} vs {params_b[k]}")
+
+    # 3. Learned Attribute Check (Weights/Coefficients/Trees)
+    # Scikit-learn convention: attributes ending in '_' are learned during fit()
+    attributes_a = {k: v for k, v in vars(model_a).items() if k.endswith('_')}
+    attributes_b = {k: v for k, v in vars(model_b).items() if k.endswith('_')}
+
+    all_attrs = set(attributes_a.keys()).union(attributes_b.keys())
+    
+    for attr in all_attrs:
+        val_a = attributes_a.get(attr)
+        val_b = attributes_b.get(attr)
+
+        try:
+            # Check for numerical arrays (weights/intercepts)
+            if isinstance(val_a, (np.ndarray, list)):
+                if not np.allclose(val_a, val_b, rtol=rtol, atol=atol):
+                    report["status"] = "Considered Identical (Numerical Drift)" if report["status"] == "Identical" else "Different"
+                    report["differences"].append(f"Learned Attribute '{attr}': Numerical values differ beyond tolerance.")
+            elif val_a != val_b:
+                report["status"] = "Different"
+                report["differences"].append(f"Attribute '{attr}': Mismatch found.")
+        except Exception as e:
+            report["differences"].append(f"Could not compare attribute '{attr}': {str(e)}")
+
+    # Final logic for "Considered Identical"
+    if report["status"] == "Identical" and not report["differences"]:
+        print("✅ Models are perfectly identical.")
+    elif "Numerical Drift" in report["status"]:
+        print("⚠️ Models are functionally equivalent but have minor numerical drift.")
+    else:
+        print("❌ Models are different.")
+
+    return report
