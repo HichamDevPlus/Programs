@@ -1,0 +1,88 @@
+import pickle
+import lightgbm as lgb
+import pandas as pd
+import numpy as np
+from sklearn.metrics import roc_auc_score, mean_squared_error, r2_score, accuracy_score
+
+def validate_and_reproduce_lgbm(df_train, df_test, target_col, pkl_path):
+    """
+    Reproduces a LightGBM model, exports predictions to CSV, and 
+    returns a comprehensive Validation Report.
+    """
+    # 1. Load the "Champion" model
+    with open(pkl_path, 'rb') as f:
+        champion_model = pickle.load(f)
+
+    # 2. Extract Metadata & Parameters
+    if hasattr(champion_model, 'get_params'):
+        params = champion_model.get_params()
+        is_classifier = isinstance(champion_model, lgb.LGBMClassifier)
+        feature_names_expected = champion_model.feature_name_
+    else:
+        params = champion_model.params
+        obj = params.get('objective', '')
+        is_classifier = any(x in obj for x in ['binary', 'multiclass', 'softmax'])
+        feature_names_expected = champion_model.feature_name()
+
+    # 3. Feature Alignment Check (Critical for MRM)
+    X_train = df_train.drop(columns=[target_col])
+    X_test = df_test.drop(columns=[target_col])
+    
+    # Reorder columns to match the pkl's expected input order
+    X_train = X_train[feature_names_expected]
+    X_test = X_test[feature_names_expected]
+    y_train = df_train[target_col]
+    y_test = df_test[target_col]
+
+    # 4. Train the "Challenger" model
+    if is_classifier:
+        challenger_model = lgb.LGBMClassifier(**params)
+    else:
+        challenger_model = lgb.LGBMRegressor(**params)
+    
+    challenger_model.fit(X_train, y_train)
+
+    # 5. Generate Predictions and Export CSVs
+    datasets = {'train': (df_train.copy(), X_train), 'test': (df_test.copy(), X_test)}
+    
+    for label, (df_out, X_proc) in datasets.items():
+        if is_classifier:
+            df_out['champ_prob'] = champion_model.predict_proba(X_proc)[:, 1]
+            df_out['chall_prob'] = challenger_model.predict_proba(X_proc)[:, 1]
+        else:
+            df_out['champ_pred'] = champion_model.predict(X_proc)
+            df_out['chall_pred'] = challenger_model.predict(X_proc)
+        
+        df_out.to_csv(f"reproduction_{label}_results.csv", sep=';', index=False)
+
+    # 6. Generate the Validation Report
+    y_champ_test = (champion_model.predict_proba(X_test)[:, 1] if is_classifier 
+                    else champion_model.predict(X_test))
+    y_chall_test = (challenger_model.predict_proba(X_test)[:, 1] if is_classifier 
+                    else challenger_model.predict(X_test))
+
+    # Calculate Drift
+    max_drift = np.max(np.abs(y_champ_test - y_chall_test))
+    avg_drift = np.mean(np.abs(y_champ_test - y_chall_test))
+
+    validation_report = {
+        "model_type": "Classification" if is_classifier else "Regression",
+        "feature_count": len(feature_names_expected),
+        "reproduction_metrics": {
+            "max_absolute_error": round(max_drift, 10),
+            "mean_absolute_error": round(avg_drift, 10),
+            "is_replicated": bool(max_drift < 1e-5)
+        },
+        "performance_metrics": {
+            "metric_name": "AUC" if is_classifier else "MSE",
+            "champion_score": roc_auc_score(y_test, y_champ_test) if is_classifier else mean_squared_error(y_test, y_champ_test),
+            "challenger_score": roc_auc_score(y_test, y_chall_test) if is_classifier else mean_squared_error(y_test, y_chall_test)
+        },
+        "hyperparameters": params
+    }
+
+    return validation_report
+
+# Usage:
+# report = validate_and_reproduce_lgbm(train_df, test_df, 'target', 'model.pkl')
+# print(report)
