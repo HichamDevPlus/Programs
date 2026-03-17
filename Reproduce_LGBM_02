@@ -1,0 +1,79 @@
+import pickle
+import lightgbm as lgb
+import pandas as pd
+import numpy as np
+from sklearn.metrics import accuracy_score, mean_squared_error, roc_auc_score
+
+def reproduce_lgbm_repetition(df_train, df_test, target_col, pkl_path):
+    """
+    Reproduces a LightGBM model from a pkl file and validates it against training data.
+    """
+    # 1. Prepare Data
+    X_train = df_train.drop(columns=[target_col])
+    y_train = df_train[target_col]
+    X_test = df_test.drop(columns=[target_col])
+    y_test = df_test[target_col]
+
+    # 2. Load the original "Champion" model
+    with open(pkl_path, 'rb') as f:
+        champion_model = pickle.load(f)
+
+    # 3. Extract Hyperparameters & Identify Model Type
+    # Handles both Sklearn-wrapper and Native Booster
+    if hasattr(champion_model, 'get_params'):
+        params = champion_model.get_params()
+        is_classifier = isinstance(champion_model, lgb.LGBMClassifier)
+    else:
+        # Native Booster logic
+        params = champion_model.params
+        # Heuristic to check objective for classification
+        obj = params.get('objective', '')
+        is_classifier = any(x in obj for x in ['binary', 'multiclass', 'softmax'])
+
+    # 4. Train the "Challenger" model
+    print(f"--- Training Challenger ({'Classifier' if is_classifier else 'Regressor'}) ---")
+    if is_classifier:
+        challenger_model = lgb.LGBMClassifier(**params)
+        metric_name = "ROC-AUC"
+        metric_fn = roc_auc_score
+    else:
+        challenger_model = lgb.LGBMRegressor(**params)
+        metric_name = "MSE"
+        metric_fn = mean_squared_error
+
+    challenger_model.fit(X_train, y_train)
+
+    # 5. Performance Comparison
+    # We use predict_proba for classifiers to get more granular comparison
+    if is_classifier:
+        y_prob_champ = champion_model.predict_proba(X_test)[:, 1]
+        y_prob_chall = challenger_model.predict_proba(X_test)[:, 1]
+    else:
+        y_prob_champ = champion_model.predict(X_test)
+        y_prob_chall = challenger_model.predict(X_test)
+
+    # Calculate Metric
+    score_champ = metric_fn(y_test, y_prob_champ)
+    score_chall = metric_fn(y_test, y_prob_chall)
+    
+    # Calculate Prediction Drift (Mean Absolute Error between the two models)
+    model_drift = np.mean(np.abs(y_prob_champ - y_prob_chall))
+
+    # 6. Report Generation
+    report = {
+        "Model Type": "Classifier" if is_classifier else "Regressor",
+        "Champion Score": round(score_champ, 6),
+        "Challenger Score": round(score_chall, 6),
+        "Inter-Model Drift": round(model_drift, 8),
+        "Identical Predictions": np.allclose(y_prob_champ, y_prob_chall, atol=1e-5),
+        "Parameters": params
+    }
+
+    print("\n--- Reproduction Results ---")
+    for key, val in report.items():
+        if key != "Parameters": print(f"{key}: {val}")
+    
+    return champion_model, challenger_model, report
+
+# Usage:
+# champ, chall, report = reproduce_lgbm_repetition(train_df, test_df, 'target', 'model.pkl')
