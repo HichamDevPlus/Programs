@@ -1,0 +1,49 @@
+import pickle
+import json
+import os
+
+def export_model_params_to_json(pkl_path, json_path):
+    """
+    Loads a pickled ML model and exports its hyperparameters to a JSON file.
+    
+    Args:
+        pkl_path (str): Path to the .pkl file.
+        json_path (str): Path where the .json file will be saved.
+    """
+    if not os.path.exists(pkl_path):
+        print(f"Error: The file '{pkl_path}' does not exist.")
+        return
+
+    try:
+        # 1. Load the model
+        with open(pkl_path, 'rb') as f:
+            model = pickle.load(f)
+
+        # 2. Extract parameters 
+        # Most Scikit-Learn models use get_params()
+        if hasattr(model, 'get_params'):
+            params = model.get_params()
+        else:
+            # Fallback for models that might store attributes differently
+            params = {k: v for k, v in vars(model).items() if not k.endswith('_')}
+
+        # 3. Sanitize for JSON (convert non-serializable objects to strings)
+        serializable_params = {}
+        for key, value in params.items():
+            try:
+                json.dumps(value)
+                serializable_params[key] = value
+            except (TypeError, OverflowError):
+                serializable_params[key] = str(value)
+
+        # 4. Save to JSON
+        with open(json_path, 'w') as jf:
+            json.dump(serializable_params, jf, indent=4)
+            
+        print(f"Successfully exported hyperparameters to: {json_path}")
+
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
+# Example usage:
+# export_model_params_to_json('my_model.pkl', 'hyperparameters.json')
