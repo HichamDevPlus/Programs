@@ -1,0 +1,74 @@
+import pickle
+import lightgbm as lgb
+import inspect
+
+def audit_model_reproducibility(pkl_path):
+    """
+    Forensically audits an LGBM pkl file for reproducibility metadata.
+    """
+    try:
+        with open(pkl_path, 'rb') as f:
+            model = pickle.load(f)
+    except Exception as e:
+        return {"error": f"Failed to load pkl: {str(e)}"}
+
+    missing_info = []
+    available_info = []
+    
+    # 1. Check for Hyperparameters
+    if hasattr(model, 'get_params'):
+        params = model.get_params()
+        available_info.append("Hyperparameters (Scikit-learn style)")
+    elif hasattr(model, 'params'):
+        params = model.params
+        available_info.append("Hyperparameters (Native Booster style)")
+    else:
+        missing_info.append("Hyperparameters (Internal parameters are missing or obfuscated)")
+
+    # 2. Check for Feature Names (Crucial for data alignment)
+    if hasattr(model, 'feature_name_') or (hasattr(model, 'feature_name') and callable(model.feature_name)):
+        available_info.append("Feature Names (Column names are preserved)")
+    else:
+        missing_info.append("Feature Names (The model only knows feature indices/positions)")
+
+    # 3. Check for Random Seed (The 'Luck' factor)
+    seed = params.get('random_state') or params.get('seed')
+    if seed is not None:
+        available_info.append(f"Random Seed (Set to: {seed})")
+    else:
+        missing_info.append("Random Seed (Not set; reproduction will be non-deterministic)")
+
+    # 4. Check for Categorical Feature Handling
+    if hasattr(model, 'categorical_feature'):
+        available_info.append("Categorical Feature Metadata")
+    else:
+        missing_info.append("Categorical Indices (Missing information on which features were treated as categories)")
+
+    # 5. Check for Pipeline Context (Transformation logic)
+    # If the model is not inside a Pipeline, we don't know the scaling/encoding steps
+    if "pipeline" not in str(type(model)).lower():
+        missing_info.append("Data Preprocessing Pipeline (Missing Imputers, Scalers, or Encoders)")
+
+    # 6. Environmental Metadata (Version tracking)
+    # Scikit-learn models usually don't store the version they were trained on inside the pkl
+    missing_info.append("Environment Metadata (Python/LGBM versions used for training are not in pkl)")
+
+    # Conclusion
+    is_reproducible = len(missing_info) == 0
+    
+    print("--- 🔍 Model Reproducibility Audit ---")
+    print(f"Status: {'✅ PASS' if is_reproducible else '⚠️ INCOMPLETE'}")
+    
+    if available_info:
+        print("\nAvailable Information:")
+        for item in available_info: print(f"  + {item}")
+        
+    if missing_info:
+        print("\nMissing Information (Action Required):")
+        for item in missing_info: print(f"  - {item}")
+
+    return {
+        "is_reproducible": is_reproducible,
+        "missing_info": missing_info,
+        "available_info": available_info
+    }
