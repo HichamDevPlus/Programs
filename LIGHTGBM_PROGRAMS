@@ -72,3 +72,122 @@ def export_model_inventory_package(model, base_filename="lgbm_model"):
 # Example Usage:
 # export_model_inventory_package(my_trained_model, "credit_risk_v1")
 ##################################################################################################################
+
+
+
+
+
+##################################################################################################################
+import pandas as pd
+import numpy as np
+import lightgbm as lgb
+import json
+import subprocess
+import sys
+from openpyxl import Workbook
+
+def perform_reproducibility_check(
+    base_filename, df_train, df_test, target, comparison_tolerance=1e-5
+):
+    """
+    Performs an MRM reproducibility check comparing a provided LightGBM model 
+    package against a locally re-trained version.
+    """
+    
+    # 1. LOAD INPUT FILES
+    with open(f"{base_filename}_hyperparams.json", 'r') as f:
+        params = json.load(f)
+    with open(f"{base_filename}_metadata.json", 'r') as f:
+        metadata = json.load(f)
+    
+    original_booster = lgb.Booster(model_file=f"{base_filename}_structure.txt")
+    orig_dump = original_booster.dump_model()
+    
+    X_train = df_train.drop(columns=[target])
+    y_train = df_train[target]
+    X_test = df_test.drop(columns=[target])
+
+    # 2. ENVIRONMENT COMPARISON
+    print("🔍 Comparing environments...")
+    current_env = subprocess.run([sys.executable, "-m", "pip", "freeze"], 
+                                 capture_output=True, text=True).stdout
+    with open(f"{base_filename}_environment.txt", 'r') as f:
+        provided_env = f.read()
+
+    # Extract versions for key packages
+    def get_versions(env_str):
+        packages = ['lightgbm', 'numpy', 'pandas', 'scikit-learn']
+        lines = env_str.split('\n')
+        return {p: next((l.split('==')[1] for l in lines if l.startswith(p+'==')), "N/A") for p in packages}
+
+    env_comparison = pd.DataFrame({
+        'Package': ['lightgbm', 'numpy', 'pandas', 'scikit-learn'],
+        'Provided': list(get_versions(provided_env).values()),
+        'Current': list(get_versions(current_env).values())
+    })
+    env_comparison['Match'] = env_comparison['Provided'] == env_comparison['Current']
+
+    # 3. RE-RUN MODEL (RE-TRAIN)
+    print("🚀 Re-running model training...")
+    # Use the scikit-learn wrapper to match the original implementation style
+    re_run_model = lgb.LGBMRegressor(**params)
+    re_run_model.fit(X_train, y_train)
+    
+    rerun_dump = re_run_model.booster_.dump_model()
+
+    # 4. STRUCTURAL TREE COMPARISON
+    print("🌳 Analyzing tree structures...")
+    tree_diffs = []
+    num_trees_orig = len(orig_dump['tree_info'])
+    num_trees_rerun = len(rerun_dump['tree_info'])
+    
+    structure_match = num_trees_orig == num_trees_rerun
+    
+    # Simple check: Compare first tree's leaf values as a proxy for similarity
+    for i in range(min(num_trees_orig, num_trees_rerun)):
+        orig_val = orig_dump['tree_info'][i]['tree_structure'].get('leaf_value', 0)
+        rerun_val = rerun_dump['tree_info'][i]['tree_structure'].get('leaf_value', 0)
+        diff = abs(orig_val - rerun_val)
+        if diff > comparison_tolerance:
+            tree_diffs.append({"Tree": i, "Original_Leaf0": orig_val, "Rerun_Leaf0": rerun_val, "Diff": diff})
+
+    # 5. GENERATE PREDICTIONS
+    print("📊 Generating predictions...")
+    df_train_preds = df_train.copy()
+    df_train_preds['pred_original'] = original_booster.predict(X_train)
+    df_train_preds['pred_rerun'] = re_run_model.predict(X_train)
+    df_train_preds['abs_diff'] = (df_train_preds['pred_original'] - df_train_preds['pred_rerun']).abs()
+
+    df_test_preds = df_test.copy()
+    df_test_preds['pred_original'] = original_booster.predict(X_test)
+    df_test_preds['pred_rerun'] = re_run_model.predict(X_test)
+    df_test_preds['abs_diff'] = (df_test_preds['pred_original'] - df_test_preds['pred_rerun']).abs()
+
+    # 6. EXPORT ANALYSIS TO EXCEL
+    with pd.ExcelWriter(f"{base_filename}_reproducibility_report.xlsx") as writer:
+        env_comparison.to_excel(writer, sheet_name='Env_Comparison', index=False)
+        
+        summary_data = {
+            "Metric": ["Tree Count Match", "Max Prediction Diff (Train)", "Max Prediction Diff (Test)", "Target Tolerance"],
+            "Value": [structure_match, df_train_preds['abs_diff'].max(), df_test_preds['abs_diff'].max(), comparison_tolerance]
+        }
+        pd.DataFrame(summary_data).to_excel(writer, sheet_name='Summary', index=False)
+        
+        if tree_diffs:
+            pd.DataFrame(tree_diffs).to_excel(writer, sheet_name='Tree_Discrepancies', index=False)
+
+    # 7. EXPORT DATASETS TO CSV
+    df_train_preds.to_csv(f"{base_filename}_train_comparison.csv", sep=";", index=False)
+    df_test_preds.to_csv(f"{base_filename}_test_comparison.csv", sep=";", index=False)
+
+    print(f"✅ Reproducibility check complete. Files generated: \n - {base_filename}_reproducibility_report.xlsx \n - {base_filename}_train_comparison.csv \n - {base_filename}_test_comparison.csv")
+##################################################################################################################
+
+
+
+
+##################################################################################################################
+
+
+
+##################################################################################################################
