@@ -1,196 +1,74 @@
-#########################################################
-import pandas as pd
-import numpy as np
+##################################################################################################################
+import json
+import subprocess
+import sys
 import lightgbm as lgb
-import shap
-import sklearn
-import matplotlib.pyplot as plt
+import pandas as pd
 
-from sklearn.inspection import PartialDependenceDisplay
-from sklearn.metrics import r2_score
-from datetime import datetime
-import json, sys, platform
+def export_model_inventory_package(model, base_filename="lgbm_model"):
+    """
+    Exports a comprehensive model package for MRM validation and reproducibility.
+    
+    Args:
+        model: A trained lgb.LGBMRegressor or lgb.LGBMClassifier object.
+        base_filename: Prefix for the exported files.
+    """
+    if not hasattr(model, 'booster_'):
+        raise ValueError("The model must be trained before exporting.")
 
+    # 1. Export Model Structure (.txt)
+    # This is the 'engine' containing the actual trees.
+    model.booster_.save_model(f"{base_filename}_structure.txt")
+    print(f"✅ Saved: {base_filename}_structure.txt")
 
-def train_lgbm_audit_model(
-    df_train,
-    df_test,
-    target_col,
-    hyperparams,
-    output_prefix="lgbm_model",
-    quantile_alpha=0.5,
-    top_n_pdp=5
-):
+    # 2. Export Hyperparameters (.json)
+    # This captures the 'recipe' used in the scikit-learn wrapper.
+    params = model.get_params()
+    with open(f"{base_filename}_hyperparams.json", 'w') as f:
+        json.dump(params, f, indent=4)
+    print(f"✅ Saved: {base_filename}_hyperparams.json")
 
-    # -----------------------------
-    # Split data
-    # -----------------------------
-    X_train = df_train.drop(columns=[target_col])
-    y_train = df_train[target_col]
-
-    X_test = df_test.drop(columns=[target_col])
-    y_test = df_test[target_col]
-
-    n, p = X_train.shape
-
-    # -----------------------------
-    # Train model
-    # -----------------------------
-    model = lgb.LGBMRegressor(**hyperparams)
-    model.fit(X_train, y_train)
-
-    # -----------------------------
-    # Predictions
-    # -----------------------------
-    y_pred_train = model.predict(X_train)
-    y_pred_test = model.predict(X_test)
-
-    residuals_train = y_train - y_pred_train
-    residuals_test = y_test - y_pred_test
-
-    # -----------------------------
-    # Metrics
-    # -----------------------------
-    def adjusted_r2(r2, n, p):
-        return 1 - (1 - r2) * (n - 1) / (n - p - 1)
-
-    def rmsle(y_true, y_pred):
-        return np.sqrt(np.mean((np.log1p(y_pred) - np.log1p(y_true)) ** 2))
-
-    def quantile_loss(y_true, y_pred, alpha):
-        diff = y_true - y_pred
-        return np.mean(np.maximum(alpha * diff, (alpha - 1) * diff))
-
-    def compute_metrics(y_true, y_pred, n, p):
-        r2 = r2_score(y_true, y_pred)
-        return {
-            "R2": r2,
-            "Adjusted_R2": adjusted_r2(r2, n, p),
-            "RMSE": np.sqrt(np.mean((y_true - y_pred) ** 2)),
-            "MAE": np.mean(np.abs(y_true - y_pred)),
-            "RMSLE": rmsle(y_true, y_pred),
-            "QuantileLoss": quantile_loss(y_true, y_pred, quantile_alpha),
-        }
-
-    metrics_df = pd.DataFrame([
-        compute_metrics(y_train, y_pred_train, n, p),
-        compute_metrics(y_test, y_pred_test, len(y_test), p)
-    ], index=["Train", "Test"])
-
-    # -----------------------------
-    # Feature importance
-    # -----------------------------
-    importance_df = pd.DataFrame({
-        "feature": X_train.columns,
-        "importance": model.feature_importances_
-    }).sort_values(by="importance", ascending=False)
-
-    importance_df.to_csv(f"{output_prefix}_feature_importance.csv", index=False)
-
-    # -----------------------------
-    # PDP plots (top features)
-    # -----------------------------
-    top_features = importance_df["feature"].head(top_n_pdp).tolist()
-
-    for feat in top_features:
-        fig, ax = plt.subplots()
-        PartialDependenceDisplay.from_estimator(
-            model, X_train, [feat], ax=ax
-        )
-        plt.title(f"PDP - {feat}")
-        plt.savefig(f"{output_prefix}_pdp_{feat}.png")
-        plt.close()
-
-    # -----------------------------
-    # SHAP
-    # -----------------------------
-    explainer = shap.TreeExplainer(model)
-    shap_values = explainer.shap_values(X_train)
-
-    shap_df = pd.DataFrame(shap_values, columns=X_train.columns)
-    shap_df.to_csv(f"{output_prefix}_shap_values.csv", index=False)
-
-    plt.figure()
-    shap.summary_plot(shap_values, X_train, show=False)
-    plt.savefig(f"{output_prefix}_shap_summary.png")
-    plt.close()
-
-    # -----------------------------
-    # Outlier diagnostics
-    # -----------------------------
-    std_resid = residuals_train / np.std(residuals_train)
-
-    diagnostics = pd.DataFrame({
-        "y_true": y_train,
-        "y_pred": y_pred_train,
-        "residual": residuals_train,
-        "std_residual": std_resid,
-        "abs_error": np.abs(residuals_train)
-    })
-
-    # Flag high influence points
-    diagnostics["outlier_flag"] = (
-        (np.abs(diagnostics["std_residual"]) > 3) |
-        (diagnostics["abs_error"] > diagnostics["abs_error"].quantile(0.99))
-    )
-
-    diagnostics.to_csv(f"{output_prefix}_diagnostics.csv", index=False)
-
-    # -----------------------------
-    # Predictions export
-    # -----------------------------
-    train_output = X_train.copy()
-    train_output["y_true"] = y_train
-    train_output["y_pred"] = y_pred_train
-    train_output["residual"] = residuals_train
-    train_output.to_csv(f"{output_prefix}_train_predictions.csv", index=False)
-
-    test_output = X_test.copy()
-    test_output["y_true"] = y_test
-    test_output["y_pred"] = y_pred_test
-    test_output["residual"] = residuals_test
-    test_output.to_csv(f"{output_prefix}_test_predictions.csv", index=False)
-
-    # -----------------------------
-    # Excel report
-    # -----------------------------
-    with pd.ExcelWriter(f"{output_prefix}_report.xlsx") as writer:
-        metrics_df.to_excel(writer, sheet_name="Metrics")
-        importance_df.to_excel(writer, sheet_name="FeatureImportance")
-        diagnostics.to_excel(writer, sheet_name="Diagnostics")
-
-    # -----------------------------
-    # Model export
-    # -----------------------------
-    model_info = {
-        "timestamp": str(datetime.now()),
-        "python_version": sys.version,
-        "platform": platform.platform(),
-        "libraries": {
-            "lightgbm": lgb.__version__,
-            "sklearn": sklearn.__version__,
-            "pandas": pd.__version__,
-            "numpy": np.__version__,
-            "shap": shap.__version__,
-        },
-        "hyperparameters_full": model.get_params(),
-        "features": list(X_train.columns),
-        "monotonic_constraints": hyperparams.get("monotone_constraints", None)
+    # 3. Export Features/Metadata (.json)
+    # Essential for ensuring the data pipeline feeds features in the right order.
+    metadata = {
+        "feature_names": model.feature_name_,
+        "n_features_in": model.n_features_in_,
+        "objective": params.get('objective'),
+        "label_column": "target" # You can customize this
     }
+    with open(f"{base_filename}_metadata.json", 'w') as f:
+        json.dump(metadata, f, indent=4)
+    print(f"✅ Saved: {base_filename}_metadata.json")
 
-    with open(f"{output_prefix}_model.txt", "w") as f:
-        f.write(json.dumps(model_info, indent=4))
-        f.write("\n\n==== MODEL STRUCTURE ====\n")
-        f.write(model.booster_.model_to_string())
+    # 4. Export Environment (.txt)
+    # Captures library versions to prevent 'version drift' errors.
+    with open(f"{base_filename}_environment.txt", "w") as f:
+        # Using subprocess to get exactly what 'pip freeze' would show
+        result = subprocess.run([sys.executable, "-m", "pip", "freeze"], 
+                                capture_output=True, text=True)
+        f.write(result.stdout)
+    print(f"✅ Saved: {base_filename}_environment.txt")
 
-    print("Audit-ready outputs generated.")
+    # 5. Export Reproducibility Guidelines (.txt)
+    # This serves as the 'instruction manual' for the validator.
+    repro_notes = (
+        "REPRODUCIBILITY CHECKLIST FOR VALIDATORS\n"
+        "========================================\n\n"
+        "To achieve bit-wise identity (exact match) when retraining:\n\n"
+        "1. SEEDING: Ensure 'random_state' is set in the LGBM constructor.\n"
+        "2. DETERMINISM: Set 'deterministic=True' in parameters.\n"
+        "3. DATA ORDER: Input data must be fed in the exact same row order.\n"
+        "4. THREADING: For 100% match, set 'n_jobs=1'. Parallel processing\n"
+        "   (multi-threading) can cause tiny floating-point variances.\n"
+        "5. HISTOGRAM: Force a specific binning logic by setting\n"
+        "   'force_col_wise=True' or 'force_row_wise=True'.\n"
+        "6. ENVIRONMENT: Ensure LightGBM and NumPy versions match the\n"
+        "   attached environment.txt file.\n"
+    )
+    with open(f"{base_filename}_reproducibility_notes.txt", "w") as f:
+        f.write(repro_notes)
+    print(f"✅ Saved: {base_filename}_reproducibility_notes.txt")
 
-    return model
-#########################################################
-
-
-
-#########################################################
-
-
-#########################################################
+# Example Usage:
+# export_model_inventory_package(my_trained_model, "credit_risk_v1")
+##################################################################################################################
