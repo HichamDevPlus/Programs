@@ -1,0 +1,120 @@
+
+from pathlib import Path
+import re
+import pandas as pd
+
+
+def split_excel_by_column(
+    XL_FILE,
+    COLUMN,
+    output_dir=None,
+    sheet_name=0,
+    include_empty=False
+):
+    """
+    Split an Excel file into separate files based on the distinct
+    values present in a specified column.
+
+    Parameters
+    ----------
+    XL_FILE : str
+        Path to the input Excel file.
+
+    COLUMN : str
+        Name of the column to use for splitting.
+        The column header must be in the first row.
+
+    output_dir : str, optional
+        Directory where the output files will be saved.
+        Defaults to the input file's directory.
+
+    sheet_name : str or int, optional
+        Worksheet to process. Defaults to the first worksheet (0).
+
+    include_empty : bool, optional
+        Whether to create an output file for empty values.
+        Defaults to False.
+
+    Returns
+    -------
+    list
+        Paths of the generated Excel files.
+    """
+
+    # Check input file
+    input_path = Path(XL_FILE)
+
+    if not input_path.is_file():
+        raise FileNotFoundError(f"File not found: {XL_FILE}")
+
+    # Define output directory
+    output_path = Path(output_dir) if output_dir else input_path.parent
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    # Read Excel file
+    df = pd.read_excel(input_path, sheet_name=sheet_name)
+
+    # Check whether the column exists
+    if COLUMN not in df.columns:
+        raise ValueError(
+            f"Column '{COLUMN}' not found. "
+            f"Available columns: {list(df.columns)}"
+        )
+
+    # Function to sanitize values for filenames
+    def sanitize_filename(value):
+        name = str(value).strip()
+        name = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "_", name)
+        name = name.rstrip(" .")
+        return name[:100] or "EMPTY"
+
+    generated_files = []
+    used_names = set()
+
+    # Get distinct values, preserving their original order
+    unique_values = df[COLUMN].drop_duplicates()
+
+    for value in unique_values:
+
+        # Handle empty values
+        is_empty = pd.isna(value)
+
+        if is_empty and not include_empty:
+            continue
+
+        # Filter rows
+        if is_empty:
+            filtered_df = df[df[COLUMN].isna()]
+            value_name = "BLANK"
+        else:
+            filtered_df = df[df[COLUMN] == value]
+            value_name = sanitize_filename(value)
+
+        # Build output filename
+        filename = f"{input_path.stem}_{value_name}.xlsx"
+        output_file = output_path / filename
+
+        # Avoid overwriting existing files or filename collisions
+        counter = 2
+        while output_file.exists() or filename.lower() in used_names:
+            filename = f"{input_path.stem}_{value_name}_{counter}.xlsx"
+            output_file = output_path / filename
+            counter += 1
+
+        used_names.add(filename.lower())
+
+        # Export filtered data
+        filtered_df.to_excel(output_file, index=False)
+
+        generated_files.append(str(output_file))
+
+    return generated_files
+
+
+
+files = split_excel_by_column(
+    XL_FILE="C:/Data/employees.xlsx",
+    COLUMN="Country"
+)
+
+print(files)
